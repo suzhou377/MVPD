@@ -13,12 +13,8 @@ import torch.nn.functional as F
 from torchvision import transforms
 from torch.autograd import Variable
 from resnet import ResNet18
-from ema_model import EMAModel
-from function import PurifyAdapter
-from function import StochasticMLP
-from function import AttnFusionUpDown
-from function import SupConLoss
-from mscat import mscat_loss
+from utils.function import SemanticExplorer, LogitExplorer, AttnFusionUpDown, SupConLoss, EMAModel
+from sade import sade_loss
 from dataset import CIFAR10
 parser = argparse.ArgumentParser(description='Adversarial Training')
 parser.add_argument('--train-batch-size', type=int, default=128, metavar='N', help='input batch size for training')
@@ -37,13 +33,15 @@ parser.add_argument('--theta3', type=int, default=1, metavar='S', help='task ali
 parser.add_argument('--theta4', type=int, default=0.1, metavar='S', help='task align')
 parser.add_argument('--theta5', type=int, default=3, metavar='S', help='task align')
 parser.add_argument('--k', type=int, default=7, metavar='S', help='task align')
+parser.add_argument('--class-num', type=float, default=10, metavar='M', help='prototype tensor')
+parser.add_argument('--dim-num', type=float, default=512, metavar='M', help='prototype tensor')
 parser.add_argument('--ema-epoch', default=76, type=int, help='Starting epoch of moving average')
 parser.add_argument('--ema-decay', default=0.999, type=float, metavar='W')
 parser.add_argument('--pac-epoch', default=75, type=int, help='Starting epoch of moving average')
 parser.add_argument('--seed', type=int, default=1, metavar='S', help='random seed')
 parser.add_argument('--no-cuda', action='store_true', default=False, help='disables CUDA training')
 parser.add_argument('--log-interval', type=int, default=100, metavar='N', help='how many batches to wait before logging training status')
-parser.add_argument('--model-dir', default='./mscat', help='directory of model for saving checkpoint')
+parser.add_argument('--model-dir', default='./sade', help='directory of model for saving checkpoint')
 args = parser.parse_args()
 def makedir(path):
     if not os.path.exists(path):
@@ -95,18 +93,16 @@ train_dataset = CIFAR10(root='./cifar10_data', train=True, download=False, trans
 test_dataset = CIFAR10(root='./cifar10_data', train=False, download=False, transform=transform_test)
 train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.train_batch_size, shuffle=True, **kwargs)
 test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.test_batch_size, shuffle=False, **kwargs)
-def train(args, model, move_average, purify_adapter, sample_adapter, fusion_adapter, train_loader, optimizer, contrastive,  epoch):
+def train(args, model, move_average, semantic_explorer, logit_explorer, fusion_explorer, train_loader, optimizer, contrastive, epoch):
     model.train()
-    start = time.time()
     robust_accuracy_total, natural_accuracy_total = 0, 0
     for batch_idx, (data, target, index) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
-        loss, robust_accuracy, natural_accuracy = mscat_loss(model=model,
-                                                                               move_average=move_average,
-                                                           purify_adapter=purify_adapter,
-                                                           sample_adapter=sample_adapter, 
-                                                           fusion_adapter=fusion_adapter, 
+        loss, robust_accuracy, natural_accuracy = mvpd_loss(model=model, 
+                                                            semantic_explorer=semantic_explorer, 
+                                                            logit_explorer=logit_explorer,
+                                                           fusion_explorer=fusion_explorer, 
                                                            x_natural=data,
                                                            y=target,
                                                            optimizer=optimizer,
@@ -118,11 +114,9 @@ def train(args, model, move_average, purify_adapter, sample_adapter, fusion_adap
                                                            theta2=args.theta2,
                                                            theta3=args.theta3,
                                                            theta4=args.theta4,
-                                                           theta5=args.theta5,
                                                            k=args.k,
-                                                           current_epoch=epoch,
-                                                           pac_epoch=args.pac_epoch)
-
+                                                           epoch=epoch,
+                                                           mvpd_epoch=args.mvpd_epoch)
         loss.backward()
         optimizer.step()
         move_average.update(epoch, ema_epoch=args.ema_epoch, decay=args.ema_decay)
@@ -168,11 +162,11 @@ def eval_pgd_whitebox(model, test_loader, num_steps):
     print('Testing Teacher： natural accuracy:{:.4f},  pgd accuracy:{:.4f}'.format(test_natural_accuracy, test_robust_accuracy))
     return test_natural_accuracy, test_robust_accuracy
 def main(args):
-    model = ResNet18(num_classes=10).to(device)
-    purify_adapter = PurifyAdapter(dim=512).to(device)
-    fusion_adapter = AttnFusionUpDown(in_dim=10, up_dim=512, head=8, hidden_ratio=0.25).to(device)
-    sample_adapter = StochasticMLP(in_dim=512, hidden_dim=128, out_dim=10).to(device)
-    optimizer = optim.SGD(list(model.parameters()) + list(purify_adapter.parameters()) + list(sample_adapter.parameters()) + list(fusion_adapter.parameters()),  
+    model = ResNet18(num_classes=args.class_num).to(device)
+    semantic_explorer = SemanticExplorer(dim=args.dim_num).to(device)
+    logit_explorer = LogitExplorer(in_dim=args.dim_num, hidden_dim=128, out_dim=args.class_num).to(device)
+    fusion_explorer = AttnFusionUpDown(in_dim=args.class_num, up_dim=args.dim_num, head=8, hidden_ratio=0.25).to(device)
+    optimizer = optim.SGD(list(model.parameters()) + list(semantic_explorer.parameters()) + list(logit_explorer.parameters()) + list(fusion_explorer.parameters()), 
                           lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
     ema_model = copy.deepcopy(model)
     move_average = EMAModel(model=model, ema_model=ema_model, update_bn=True)
@@ -188,18 +182,18 @@ def main(args):
         train_test_start = time.time()
         adjust_learning_rate(args, optimizer, epoch)
         print('=============================Training Epoch {}================================='.format(epoch))
-        train_natural_accuracy, train_robust_accuracy = train(args, model, move_average, purify_adapter, sample_adapter, fusion_adapter, train_loader, optimizer, contrastive, ema_logit, epoch)
+        train_natural_accuracy, train_robust_accuracy = train(args, model, move_average, semantic_explorer, logit_explorer, fusion_explorer, train_loader, optimizer, contrastive, epoch)
         train_end = time.time()
         logger.log(
             'Training: Robust Accuracy: {:.4f}.\tNatural Accuracy: {:.4f}.\tLR: {:.4f}.\tTime taken: {:.4f}'
             .format(train_robust_accuracy, train_natural_accuracy,
                     optimizer.param_groups[0]['lr'], (train_end - train_test_start) / 60))
         print('==============================Testing Epoch {}================================'.format(epoch))
-        test_natural_accuracy, test_robust_accuracy = eval_pgd_whitebox(model, test_loader, num_steps=args.test_num_steps)
+        test_natural_accuracy, test_robust_accuracy = eval_pgd_whitebox(move_average, test_loader, num_steps=args.test_num_steps)
         test_end = time.time()
         logger.log('Testing Teacher: Natural Accuracy: {:.4f}.\tRobust Accuracy: {:.4f}\tTime taken:{:.4f}'
                    .format(test_natural_accuracy, test_robust_accuracy, (test_end - train_test_start) / 60))
-        torch.save(model.state_dict(), os.path.join(args.model_dir, 'mscat_{}.py'.format(epoch)))
+        torch.save(move_average.ema_model.state_dict(), os.path.join(args.model_dir, 'mscat_{}.py'.format(epoch)))
     end = time.time()
     print('Final time: %.3f' % ((end - start) / 60) + ' min')
     logger.log('\n')
