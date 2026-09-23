@@ -86,7 +86,6 @@ class Wide_ResNet(nn.Module):
         out = self.block2(out)
         out = self.block3(out)
         out = self.relu(self.bn1(out))
-        '''池化、全连接'''
         out = F.avg_pool2d(out, 8)
         emb = out.view(-1, self.nChannels)
         logit = self.classifier_linear(emb)
