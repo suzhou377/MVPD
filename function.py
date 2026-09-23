@@ -8,56 +8,35 @@ import torch.fft as fft
 from torchvision import transforms
 import torch.nn.functional as F
 from torch.autograd import Variable
-from torch.nn.utils import spectral_norm
-from torch.distributions.bernoulli import Bernoulli
 
-class FusionMLP(nn.Module):
-    def __init__(self, logit_dim, hidden_dim=128, act=nn.GELU):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(logit_dim * 3, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            act(),
-            nn.Linear(hidden_dim, logit_dim)
-        )
-    def forward(self, logit1, logit2, logit3):
-        concat_logits = torch.cat([logit1, logit2, logit3], dim=1)
-        fused_logit = self.mlp(concat_logits)
-        return fused_logit
-def BSL(labels, logits, sample_per_class):
-    spc = torch.tensor(sample_per_class).type_as(logits)
-    spc = spc.unsqueeze(0).expand(logits.shape[0], -1)
-    logits = logits + (spc + 1).log()
-    loss = F.cross_entropy(input=logits, target=labels)
-    return loss
-
-
-class PurifyAdapter(nn.Module):
+class SemanticExplorer(nn.Module):
     def __init__(self, dim=512):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, num_heads=8, batch_first=True)
         self.norm2 = nn.LayerNorm(dim)
+
         self.up_ffn = nn.Sequential(
             nn.Linear(dim, dim * 4),
             nn.GELU(),
             nn.Linear(dim * 4, dim)
         )
+        self.down_ffn = nn.Sequential(
+            nn.Linear(dim, dim // 4),
+            nn.GELU(),
+            nn.Linear(dim // 4, dim)
+        )
 
     def forward(self, x):
-        residual = x
-        x = self.norm1(x)
-        x = self.attn(x, x, x)[0]
-        x = x + residual
-        residual = x
-        x = self.norm2(x)
-        x = self.up_ffn(x)
-        x = x + residual
-        return x
+        x = x + self.attn(self.norm1(x), self.norm1(x), self.norm1(x))[0]
+        h = self.norm2(x)
+
+        x_up = x + self.up_ffn(h)
+        x_down = x + self.down_ffn(h)
+
+        return x_up, x_down
 
 
-
-    
 class UpAdapter(nn.Module):
     def __init__(self, in_dim=10, up_dim=512, hidden_ratio=0.25, act=nn.GELU): 
         super().__init__()
@@ -74,7 +53,7 @@ class DownAdapter(nn.Module):
     def forward(self, x):
         return self.net(x) 
 class AttnFusionUpDown(nn.Module):
-    def __init__(self, in_dim=10, up_dim=512, head=8, hidden_ratio=0.25): 
+    def __init__(self, in_dim=10, up_dim=512, head=4, hidden_ratio=0.25): 
         super().__init__()
         self.up_logit = UpAdapter(in_dim, up_dim, hidden_ratio, nn.GELU)
         self.up_group = UpAdapter(in_dim, up_dim, hidden_ratio, nn.GELU)
@@ -89,29 +68,33 @@ class AttnFusionUpDown(nn.Module):
         out = self.down(out).squeeze(1)              
         return out
 
-class StochasticMLP(nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim): 
+class LogitExplorer(nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 2 * out_dim))
+
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
-        return mu + eps * std         
+        return mu + eps * std
+
     def forward(self, x, n_samples=1):
-        out = self.net(x)                     
-        mu, logvar = out.chunk(2, dim=1)      
-        logvar = torch.clamp(logvar, min=-10, max=10)
+        out = self.net(x)
+        mu_base, logvar_base = out.chunk(2, dim=1) 
+        logvar_base = torch.clamp(logvar_base, min=-10, max=10)
+
         if n_samples > 1:
-            mu  = mu.unsqueeze(1).expand(-1, n_samples, -1)   
-            logvar = logvar.unsqueeze(1).expand(-1, n_samples, -1)
-            sample = self.reparameterize(mu, logvar)       
-            return sample, mu.mean(1), logvar.mean(1)     
+            mu  = mu_base.unsqueeze(1).expand(-1, n_samples, -1)   
+            logvar = logvar_base.unsqueeze(1).expand(-1, n_samples, -1)
+            sample = self.reparameterize(mu, logvar)
+            return sample, mu_base, logvar_base
         else:
-            sample = self.reparameterize(mu, logvar)        
-            return sample, mu, logvar
+            sample = self.reparameterize(mu_base, logvar_base)
+            return sample, mu_base, logvar_base
+
     @staticmethod
     def kl_loss(mu, logvar):
         return -0.5 * (1 + logvar - mu**2 - logvar.exp()).mean()
@@ -168,4 +151,30 @@ class SupConLoss(nn.Module):
         loss = - mean_log_prob_pos.view(anchor_count, batch_size).mean()
         return loss
 
+
+class EMAModel(torch.nn.Module):
+    def __init__(self, model, ema_model, update_bn=True):
+        super(EMAModel, self).__init__()  
+        self.model = model
+        self.ema_model = ema_model
+        self.update_bn = update_bn
+        self.decay_rate = 0.
+    def forward(self, x):
+        x = self.ema_model(x)
+        return x
+    def update(self, epoch, ema_epoch, decay):
+        if epoch < ema_epoch:
+            self.decay_rate = 0.
+        else:
+            self.decay_rate = decay
+        with torch.no_grad():
+            for param, ema_param in zip(self.model.parameters(), self.ema_model.parameters()):
+                ema_param.data.mul_(self.decay_rate).add_(param.data, alpha=1 - self.decay_rate)
+            if self.update_bn:
+                for module, ema_module in zip(self.model.modules(), self.ema_model.modules()):
+                    if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                        ema_module.running_mean.mul_(self.decay_rate).add_(module.running_mean,
+                                                                           alpha=1 - self.decay_rate)
+                        ema_module.running_var.mul_(self.decay_rate).add_(module.running_var, alpha=1 - self.decay_rate)
+                        ema_module.num_batches_tracked = module.num_batches_tracked
 
