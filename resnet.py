@@ -110,7 +110,6 @@ class ResNet(nn.Module):
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.layer4(out)
-        '''池化、全连接'''
         out = F.avg_pool2d(out, 4)
         out = out.view(out.size(0), -1)
         logit = self.linear(out)
@@ -133,10 +132,3 @@ def ResNet101():
 def ResNet152():
     return ResNet(Bottleneck, [3,8,36,3])
 
-
-# def test():
-#     net = cbam_ResNet18()
-#     y = net(Variable(torch.randn(1,3,32,32)))
-#     print(y.size())
-#     print(net)
-# test()
